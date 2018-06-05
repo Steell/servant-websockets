@@ -20,10 +20,14 @@ library
   build-depends:       aeson
                      , async
                      , base >= 4.7 && < 5
+                     , binary
                      , bytestring
                      , conduit
                      , exceptions
+                     , mtl
                      , resourcet
+                     , servant-client
+                     , servant-client-core
                      , servant-server
                      , text
                      , wai

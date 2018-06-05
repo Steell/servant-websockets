@@ -9,19 +9,27 @@ module Servant.API.WebSocketConduit where
 
 import Control.Concurrent                         (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.Async                   (race_)
-import Control.Monad                              (forever, (>=>))
+import Control.Monad                              (forever, void, (>=>))
 import Control.Monad.Catch                        (handle)
 import Control.Monad.IO.Class                     (liftIO)
+import Control.Monad.Reader.Class                 (asks)
 import Control.Monad.Trans.Resource               (ResourceT, runResourceT)
 import Data.Aeson                                 (FromJSON, ToJSON, decode, encode)
+import Data.Binary.Builder                        (toLazyByteString)
 import Data.ByteString.Lazy                       (fromStrict)
 import Data.Conduit                               (Conduit, runConduitRes, yieldM, (.|))
+import Data.Monoid                                ((<>))
 import Data.Proxy                                 (Proxy (..))
+import Data.String                                (fromString)
 import Data.Text                                  (Text)
 import Network.Wai.Handler.WebSockets             (websocketsOr)
 import Network.WebSockets                         (ConnectionException, acceptRequest, defaultConnectionOptions,
-                                                   forkPingThread, receiveData, receiveDataMessage, sendClose,
-                                                   sendTextData)
+                                                   forkPingThread, receiveData, receiveDataMessage, runClient,
+                                                   sendClose, sendTextData)
+import Servant.Client                             (HasClient(..), ClientM, baseUrl, Response)
+import Servant.Client.Core.Internal.BaseUrl       (BaseUrl(..))
+import Servant.Client.Core.Internal.Request       (Request, requestPath)
+import Servant.Client.Core.Internal.RunClient     (RunClient)
 import Servant.Server                             (HasServer (..), ServantErr (..), ServerT)
 import Servant.Server.Internal.Router             (leafRouter)
 import Servant.Server.Internal.RoutingApplication (RouteResult (..), runDelayed)
@@ -66,11 +74,13 @@ instance (FromJSON i, ToJSON o) => HasServer (WebSocketConduit i o) ctx where
     runDelayed app env request >>= liftIO . go request respond
    where
     go request respond (Route cond) =
-      websocketsOr
-        defaultConnectionOptions
-        (runWSApp cond)
-        (backupApp respond)
-        request (respond . Route)
+      let app = websocketsOr
+                  defaultConnectionOptions
+                  (runWSApp cond)
+                  (backupApp respond)
+      in
+        app request (respond . Route)
+
     go _ respond (Fail e) = respond $ Fail e
     go _ respond (FailFatal e) = respond $ FailFatal e
 
@@ -93,3 +103,30 @@ instance (FromJSON i, ToJSON o) => HasServer (WebSocketConduit i o) ctx where
                                                       , errBody = mempty
                                                       , errHeaders = mempty
                                                       }
+
+class RunClient m => RunWebsocketClient m where
+  websocketRequest
+    :: (FromJSON i, ToJSON o) => Request -> Conduit i (ResourceT IO) o -> m ()
+
+instance RunWebsocketClient ClientM where
+  websocketRequest req cond = do
+    burl <- asks baseUrl
+    let path = show $ fromString (baseUrlPath burl)
+                   <> toLazyByteString (requestPath req)
+        host = baseUrlHost burl
+        port = baseUrlPort burl
+    liftIO . runClient host port path $ \c ->
+      handle (\(_ :: ConnectionException) -> return ()) $ do
+        forkPingThread c 10
+        i <- newEmptyMVar
+        race_ (forever $ receiveData c >>= putMVar i) $ do
+          runConduitRes $ forever (yieldM . liftIO $ takeMVar i)
+            .| CL.mapMaybe (decode . fromStrict)
+            .| cond
+            .| CL.mapM_ (liftIO . sendTextData c . encode)
+        sendClose c ("Out of data" :: Text)
+        forever $ receiveDataMessage c
+
+instance (ToJSON i, FromJSON o, RunWebsocketClient m) => HasClient m (WebSocketConduit i o) where
+  type Client m (WebSocketConduit i o) = Conduit o (ResourceT IO) i -> m ()
+  clientWithRoute pm Proxy = websocketRequest
